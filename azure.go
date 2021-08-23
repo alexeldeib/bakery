@@ -6,29 +6,39 @@ import (
 	"net/http/httputil"
 
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2021-04-01/compute"
+	"github.com/Azure/azure-sdk-for-go/services/containerservice/mgmt/2021-03-01/containerservice"
 	"github.com/Azure/go-autorest/autorest"
 )
 
 type AzureClients struct {
-	Disks                     compute.DisksClient
-	Snapshots                 compute.SnapshotsClient
-	Galleries                 compute.GalleriesClient
-	GalleryImages             compute.GalleryImagesClient
-	GalleryImageVersions      compute.GalleryImageVersionsClient
-	VirtualMachines           compute.VirtualMachinesClient
-	VirtualMachineScaleSets   compute.VirtualMachineScaleSetsClient
+	// Disks compute.DisksClient
+	// Snapshots            compute.SnapshotsClient
+	Galleries            compute.GalleriesClient
+	GalleryImages        compute.GalleryImagesClient
+	GalleryImageVersions compute.GalleryImageVersionsClient
+	ManagedClusters      containerservice.ManagedClustersClient
+	// VirtualMachines           compute.VirtualMachinesClient
+	// VirtualMachineScaleSets   compute.VirtualMachineScaleSetsClient
 	VirtualMachineScaleSetVMs compute.VirtualMachineScaleSetVMsClient
 }
 
 func NewClients(sub string, auth autorest.Authorizer) *AzureClients {
 	return &AzureClients{
-		Disks:                     NewDisksClient(sub, auth),
+		// Disks:                NewDisksClient(sub, auth),
+		// Snapshots:                 NewSnapshotsClient(sub, auth),
 		Galleries:                 NewGalleriesClient(sub, auth),
 		GalleryImages:             NewGalleryImagesClient(sub, auth),
 		GalleryImageVersions:      NewGalleryImageVersionsClient(sub, auth),
-		Snapshots:                 NewSnapshotsClient(sub, auth),
+		ManagedClusters:           NewManagedClustersClient(sub, auth),
 		VirtualMachineScaleSetVMs: NewVirtualMachineScaleSetVMsClient(sub, auth),
 	}
+}
+
+// NewManagedClustersClient returns an authenticated client using the provided authorizer factory.
+func NewManagedClustersClient(sub string, authorizer autorest.Authorizer) containerservice.ManagedClustersClient {
+	client := containerservice.NewManagedClustersClient(sub)
+	client.Authorizer = authorizer
+	return client
 }
 
 // NewDisksClient returns an authenticated client using the provided authorizer factory.

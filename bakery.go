@@ -11,7 +11,6 @@ import (
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/hashicorp/go-multierror"
-	"github.com/sanity-io/litter"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -83,19 +82,42 @@ func (c *snapshot) isValid() error {
 }
 
 type Bakery struct {
-	Cloud *AzureClients
-	Auth  autorest.Authorizer
-	Kube  client.Client
+	Auth                autorest.Authorizer
+	Kube                client.Client
+	NewKubeconfigGetter KubeconfigGetterFactory
 }
 
 func (b *Bakery) createSnapshot(args *snapshot) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*600)
 	defer cancel()
+
+	clusterSubscription := args.ManagedCluster.SubscriptionID
+	clusterResourceGroup := args.ManagedCluster.ResourceGroupName
+	clusterName := args.ManagedCluster.ClusterName
+	gallerySub := args.SharedImageGallery.SubscriptionID
+	galleryName := args.SharedImageGallery.GalleryName
+	galleryResourceGroup := args.SharedImageGallery.ResourceGroupName
+	imageDefinitionName := args.SharedImageGallery.ImageDefinition
+	imageVersionName := args.SharedImageGallery.ImageVersion
+
+	srcclient := NewClients(clusterSubscription, b.Auth)
+	dstclient := NewClients(gallerySub, b.Auth)
+
+	kubeconfig, err := b.NewKubeconfigGetter(srcclient.ManagedClusters)(ctx, clusterSubscription, clusterResourceGroup, clusterName)
+	if err != nil {
+		return fmt.Errorf("failed to get kubeconfig. %w", err)
+	}
+
+	kubeclient, err := client.New(kubeconfig, client.Options{})
+	if err != nil {
+		return fmt.Errorf("failed to create kubeclient. %w", err)
+	}
+
 	var node corev1.Node
 	var key = types.NamespacedName{
 		Name: args.NodeName,
 	}
-	if err := b.Kube.Get(ctx, key, &node); err != nil {
+	if err := kubeclient.Get(ctx, key, &node); err != nil {
 		// if status := apierror.APIStatus(nil); errors.As(err, &status) {
 		// 	return &apiError{
 		// 		Err:  err,
@@ -109,18 +131,10 @@ func (b *Bakery) createSnapshot(args *snapshot) error {
 	// Trimmed ID: /subscriptions/<subscription id>/resourceGroups/k8sblogkk1/providers/Microsoft.Compute/virtualMachineScaleSets/k8s-agentpool1-92998111-vmss/virtualMachines/0
 	// Tokenized ID: [subscriptions, <ID>, resourceGroups, <RG>, providers, Microsoft.Compute, virtualMachineScaleSets, <VMSS>, virtualMachines, 0]
 	// sub: tokens[1], rg: tokens[3], vmss: tokens[7], instance: tokens[9]
-	subscriptionID, resourceGroup, scaleSet, instance, err := tokenizeProviderID(node.Spec.ProviderID)
+	resourceGroup, scaleSet, instance, err := tokenizeProviderID(node.Spec.ProviderID)
 	if err != nil {
 		return fmt.Errorf("failed to tokenize spec.providerID. %w", err)
 	}
-	gallerySub := args.SharedImageGallery.SubscriptionID
-	galleryName := args.SharedImageGallery.GalleryName
-	galleryResourceGroup := args.SharedImageGallery.ResourceGroupName
-	imageDefinitionName := args.SharedImageGallery.ImageDefinition
-	imageVersionName := args.SharedImageGallery.ImageVersion
-
-	srcclient := NewClients(subscriptionID, b.Auth)
-	dstclient := NewClients(gallerySub, b.Auth)
 
 	vm, err := srcclient.VirtualMachineScaleSetVMs.Get(ctx, resourceGroup, scaleSet, instance, compute.InstanceViewTypesInstanceView)
 	if err != nil {
@@ -128,36 +142,97 @@ func (b *Bakery) createSnapshot(args *snapshot) error {
 	}
 
 	if vm.InstanceView == nil || vm.InstanceView.Statuses == nil {
-		return fmt.Errorf("expected to find powerState and provisioninState statuses")
+		return fmt.Errorf("expected to find powerState and provisioningState statuses")
 	}
 
-	var isDeallocated bool
+	// var isDeallocated bool
+	var isRunning bool
 	for _, status := range *vm.InstanceView.Statuses {
-		litter.Dump(status)
-		if status.Code != nil && *status.Code == "PowerState/deallocated" {
-			isDeallocated = true
+		if status.Code != nil {
+			// if *status.Code == "PowerState/deallocated" {
+			// 	isDeallocated = true
+			// }
+			if *status.Code == "PowerState/running" {
+				isRunning = true
+			}
 		}
 	}
 
-	if !isDeallocated {
-		vmFuture, err := srcclient.VirtualMachineScaleSetVMs.Deallocate(ctx, resourceGroup, scaleSet, instance)
+	if !isRunning {
+		vmFuture, err := srcclient.VirtualMachineScaleSetVMs.Start(ctx, resourceGroup, scaleSet, instance)
 		if err != nil {
-			return fmt.Errorf("failed to start vm deallocation. %w", err)
+			return fmt.Errorf("failed to start vm start. %w", err)
 		}
 
 		if err := vmFuture.WaitForCompletionRef(ctx, srcclient.VirtualMachineScaleSetVMs.Client); err != nil {
-			return fmt.Errorf("failed to wait for vm deallocation future. %w", err)
+			return fmt.Errorf("failed to wait for vm start future. %w", err)
 		}
 
 		result, err := vmFuture.Result(srcclient.VirtualMachineScaleSetVMs)
 		if err != nil {
-			return fmt.Errorf("failed to get result of deallocation. %w", err)
+			return fmt.Errorf("failed to get result of start. %w", err)
 		}
 
 		if result.StatusCode != http.StatusOK {
-			return fmt.Errorf("expected http 200 deallocating vm, got status code %d", result.StatusCode)
+			return fmt.Errorf("expected http 200 starting vm, got status code %d", result.StatusCode)
 		}
 	}
+
+	tweakPod := getTweakPod(args.NodeName)
+	if err := kubeclient.Create(ctx, &tweakPod); err != nil {
+		return fmt.Errorf("failed to create tweak pod. %w", err)
+	}
+
+	podKey := types.NamespacedName{
+		Namespace: "kube-system",
+		Name:      tweakPod.Name,
+	}
+
+	podCtx, podCancel := context.WithTimeout(ctx, time.Second*60)
+	defer podCancel()
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	var getErr error
+
+podWait:
+	for {
+		select {
+		case <-podCtx.Done():
+			return fmt.Errorf("timed out waiting for tweak pod to finish")
+		case <-ticker.C:
+			if getErr = kubeclient.Get(podCtx, podKey, &tweakPod); getErr != nil {
+				fmt.Printf("failed to get tweak pod. %s\n", getErr)
+				continue
+			}
+			if tweakPod.Status.Phase == "Running" || tweakPod.Status.Phase == "Succeeded" {
+				break podWait
+			}
+			if tweakPod.Status.Phase == "Failed" {
+				return fmt.Errorf("tweak pod failed with message: %#+v", &tweakPod.Status.Conditions)
+			}
+		}
+	}
+
+	// if !isDeallocated {
+	vmFuture, err := srcclient.VirtualMachineScaleSetVMs.Deallocate(ctx, resourceGroup, scaleSet, instance)
+	if err != nil {
+		return fmt.Errorf("failed to start vm deallocation. %w", err)
+	}
+
+	if err := vmFuture.WaitForCompletionRef(ctx, srcclient.VirtualMachineScaleSetVMs.Client); err != nil {
+		return fmt.Errorf("failed to wait for vm deallocation future. %w", err)
+	}
+
+	result, err := vmFuture.Result(srcclient.VirtualMachineScaleSetVMs)
+	if err != nil {
+		return fmt.Errorf("failed to get result of deallocation. %w", err)
+	}
+
+	if result.StatusCode != http.StatusOK {
+		return fmt.Errorf("expected http 200 deallocating vm, got status code %d", result.StatusCode)
+	}
+	// }
 
 	vm, err = srcclient.VirtualMachineScaleSetVMs.Get(ctx, resourceGroup, scaleSet, instance, compute.InstanceViewTypesInstanceView)
 	if err != nil {
@@ -228,6 +303,7 @@ func (b *Bakery) createSnapshot(args *snapshot) error {
 	}
 
 	// attempting to overwrite existing image version. reject.
+	// TODO(ace): allow a force parameter?
 	if err == nil {
 		return fmt.Errorf("image version already exists. refusing to overwrite")
 	}
@@ -267,13 +343,31 @@ func (b *Bakery) createSnapshot(args *snapshot) error {
 		return fmt.Errorf("expected http 200 creating gallery, got status code %d", output.StatusCode)
 	}
 
+	startFuture, err := srcclient.VirtualMachineScaleSetVMs.Start(ctx, resourceGroup, scaleSet, instance)
+	if err != nil {
+		return fmt.Errorf("failed to start vm start. %w", err)
+	}
+
+	if err := startFuture.WaitForCompletionRef(ctx, srcclient.VirtualMachineScaleSetVMs.Client); err != nil {
+		return fmt.Errorf("failed to wait for vm start future. %w", err)
+	}
+
+	result, err = startFuture.Result(srcclient.VirtualMachineScaleSetVMs)
+	if err != nil {
+		return fmt.Errorf("failed to get result of start. %w", err)
+	}
+
+	if result.StatusCode != http.StatusOK {
+		return fmt.Errorf("expected http 200 starting vm, got status code %d", result.StatusCode)
+	}
+
 	return nil
 }
 
 // func (b *bakery) getSnapshot()                                 {}
 // func (b *bakery) deleteSnapshot() apiError { return nil }
 
-func tokenizeProviderID(providerID string) (subscriptionID, resourceGroup, scaleSet, instance string, err error) {
+func tokenizeProviderID(providerID string) (resourceGroup, scaleSet, instance string, err error) {
 	providerID = strings.TrimPrefix(providerID, "azure://")
 	providerIDTokens := strings.Split(providerID, "/")[1:]
 	providerIDTokenMap := make(map[int]string)
@@ -287,7 +381,7 @@ func tokenizeProviderID(providerID string) (subscriptionID, resourceGroup, scale
 	}
 
 	if l := len(providerIDTokens); l != 10 {
-		return "", "", "", "", fmt.Errorf("invalid spec.providerID %s. expected 10 token segments, found %d", providerID, l)
+		return "", "", "", fmt.Errorf("invalid spec.providerID %s. expected 10 token segments, found %d", providerID, l)
 
 	}
 
@@ -297,13 +391,12 @@ func tokenizeProviderID(providerID string) (subscriptionID, resourceGroup, scale
 
 	for k, v := range expectedTokenMap {
 		if !strings.EqualFold(v, providerIDTokenMap[k]) {
-			return "", "", "", "", fmt.Errorf("invalid spec.providerID %s. expected token %d to be %s", providerID, k, v)
+			return "", "", "", fmt.Errorf("invalid spec.providerID %s. expected token %d to be %s", providerID, k, v)
 		}
 	}
 
-	subscriptionID = providerIDTokenMap[1]
 	resourceGroup = providerIDTokenMap[3]
 	scaleSet = providerIDTokenMap[7]
 	instance = providerIDTokenMap[9]
-	return subscriptionID, resourceGroup, scaleSet, instance, nil
+	return resourceGroup, scaleSet, instance, nil
 }

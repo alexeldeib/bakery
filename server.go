@@ -89,9 +89,9 @@ func newHTTPServer(addr string, bakery *Bakery, log logr.Logger) *HTTPServer {
 
 	s.srv = http.Server{
 		Addr:         addr,
-		ReadTimeout:  600 * time.Second,
-		WriteTimeout: 600 * time.Second,
-		IdleTimeout:  600 * time.Second,
+		ReadTimeout:  3600 * time.Second, // TODO(ace): split into frontend/async with workqueue?
+		WriteTimeout: 3600 * time.Second,
+		IdleTimeout:  3600 * time.Second,
 		Handler:      router,
 	}
 

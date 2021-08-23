@@ -56,13 +56,14 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { <-int; cancel() }()
 
-	if err := run(ctx, cancel, log, &fl); err != nil {
+	if err := run(ctx, log, &fl); err != nil {
 		log.Error(err, "error running serving, shutting down")
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, cancel context.CancelFunc, log logr.Logger, fl *flags) error {
+// TODO(ace): cleanup...
+func run(ctx context.Context, log logr.Logger, fl *flags) error {
 	auth, err := auth.NewAuthorizerFromEnvironment()
 	// msiConfig := NewMSIConfig(fl.idendityID)
 
@@ -91,9 +92,9 @@ func run(ctx context.Context, cancel context.CancelFunc, log logr.Logger, fl *fl
 	}
 
 	bakery := &Bakery{
-		Kube:  kubeclient,
-		Auth:  auth,
-		Cloud: NewClients(fl.subscriptionID, auth),
+		Kube:                kubeclient,
+		Auth:                auth,
+		NewKubeconfigGetter: NewKubeconfigGetter,
 	}
 
 	server := newHTTPServer("0.0.0.0:8080", bakery, log)
@@ -106,12 +107,9 @@ func run(ctx context.Context, cancel context.CancelFunc, log logr.Logger, fl *fl
 		close(done)
 	}()
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
+	<-ctx.Done()
 
-	<-c
-
-	ctx, cancel = context.WithTimeout(context.Background(), time.Second*15)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 	defer cancel()
 	server.Shutdown(ctx)
 
